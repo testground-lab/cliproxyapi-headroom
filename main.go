@@ -35,6 +35,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"unsafe"
 )
 
@@ -76,13 +77,27 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	if request != nil && requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+	raw, ok := dispatch(C.GoString(method), requestBytes, handleMethod)
+	writeResponse(response, raw)
+	if !ok {
 		return 1
 	}
-	writeResponse(response, raw)
 	return 0
+}
+
+// dispatch runs a method handler and converts errors and panics into error
+// envelopes. An unrecovered panic in a c-shared library aborts the host process.
+func dispatch(method string, request []byte, handle func(string, []byte) ([]byte, error)) (raw []byte, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			raw, ok = errorEnvelope("plugin_panic", fmt.Sprint(r)), false
+		}
+	}()
+	out, errHandle := handle(method, request)
+	if errHandle != nil {
+		return errorEnvelope("plugin_error", errHandle.Error()), false
+	}
+	return out, true
 }
 
 //export cliproxyPluginFree

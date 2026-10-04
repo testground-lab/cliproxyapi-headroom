@@ -207,3 +207,14 @@ func TestLiveHeadroom(t *testing.T) {
 	}
 	t.Logf("real Headroom: %d -> %d bytes", len(raw), len(got))
 }
+func TestDispatchRecoversPanic(t *testing.T) {
+	raw, ok := dispatch("request.intercept_before", nil, func(string, []byte) ([]byte, error) { panic("boom") })
+	var env envelope
+	if ok || json.Unmarshal(raw, &env) != nil || env.OK || env.Error == nil || env.Error.Code != "plugin_panic" || env.Error.Message != "boom" {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+	raw, ok = dispatch("x", nil, func(string, []byte) ([]byte, error) { return nil, os.ErrNotExist })
+	if ok || json.Unmarshal(raw, &env) != nil || env.Error == nil || env.Error.Code != "plugin_error" {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+}
