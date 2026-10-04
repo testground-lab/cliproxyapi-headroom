@@ -227,3 +227,16 @@ func TestDefaultEndpointIsLoopback(t *testing.T) {
 		t.Fatalf("default endpoint = %s", got)
 	}
 }
+func TestPluginCallRejectsOversizedRequestWithoutReading(t *testing.T) {
+	for _, n := range []uint64{maxRequestBytes + 1, 1 << 31, 1<<64 - 1} {
+		raw, ok := pluginCall("request.intercept_before", n, func() []byte { t.Fatal("request was read"); return nil })
+		var env envelope
+		if ok || json.Unmarshal(raw, &env) != nil || env.Error == nil || env.Error.Code != "request_too_large" {
+			t.Fatalf("len=%d ok=%v raw=%s", n, ok, raw)
+		}
+	}
+	raw, ok := pluginCall("request.intercept_before", 1, func() []byte { panic("read failed") })
+	if ok || !strings.Contains(string(raw), "plugin_panic") {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+}

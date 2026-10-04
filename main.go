@@ -64,7 +64,13 @@ func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api)
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (rc C.int) {
+	defer func() {
+		if r := recover(); r != nil {
+			writeResponse(response, errorEnvelope("plugin_panic", fmt.Sprint(r)))
+			rc = 1
+		}
+	}()
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
@@ -73,16 +79,35 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
-	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
-	}
-	raw, ok := dispatch(C.GoString(method), requestBytes, handleMethod)
+	raw, ok := pluginCall(C.GoString(method), uint64(requestLen), func() []byte {
+		if request == nil || requestLen == 0 {
+			return nil
+		}
+		return C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+	})
 	writeResponse(response, raw)
 	if !ok {
 		return 1
 	}
 	return 0
+}
+
+// maxRequestBytes bounds one RPC envelope. Bodies are base64 in JSON, so a
+// 32 MiB body (the compression limit) needs about 43 MiB of envelope.
+const maxRequestBytes = 48 << 20
+
+// pluginCall validates the request size before copying it out of C memory, so
+// an oversized length can neither wrap C.int nor force a huge allocation.
+func pluginCall(method string, requestLen uint64, read func() []byte) (raw []byte, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			raw, ok = errorEnvelope("plugin_panic", fmt.Sprint(r)), false
+		}
+	}()
+	if requestLen > maxRequestBytes {
+		return errorEnvelope("request_too_large", "request exceeds plugin size limit"), false
+	}
+	return dispatch(method, read(), handleMethod)
 }
 
 // dispatch runs a method handler and converts errors and panics into error
