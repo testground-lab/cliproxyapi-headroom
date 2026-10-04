@@ -264,6 +264,10 @@ func compressBody(req interceptRequest, cfg *runtimeConfig) (output []byte, fail
 	if err := dec.Decode(&body); err != nil {
 		return nil, nil
 	}
+	// Re-encoding only the first value would silently drop trailing data.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, nil
+	}
 	selected := candidates(body, cfg.MinChars, cfg.CompressUserMessages)
 	if len(selected) == 0 {
 		return nil, nil

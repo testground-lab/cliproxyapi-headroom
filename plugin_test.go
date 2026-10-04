@@ -298,3 +298,19 @@ func TestInterceptConcurrencyNeverExceedsLimit(t *testing.T) {
 		t.Fatalf("peak=%d passed=%d inflight=%d", peak.Load(), passed.Load(), len(compressionSlots))
 	}
 }
+func TestTrailingJSONLeavesRequestUnchanged(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.WriteHeader(500) }))
+	defer srv.Close()
+	setup(t, srv.URL)
+	obj := `{"messages":[{"role":"tool","content":"` + strings.Repeat("x", 50) + `"}]}`
+	for _, body := range []string{obj + obj, obj + " garbage", obj + "]"} {
+		out, err := compressBody(interceptRequest{Body: []byte(body)}, settings.Load())
+		if out != nil || err != nil || called {
+			t.Fatalf("body=%q out=%q err=%v called=%v", body, out, err, called)
+		}
+	}
+	if _, _ = compressBody(interceptRequest{Body: []byte(obj + " \n")}, settings.Load()); !called {
+		t.Fatal("trailing whitespace should still be accepted")
+	}
+}
