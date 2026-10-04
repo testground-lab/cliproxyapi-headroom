@@ -54,7 +54,7 @@ func configure(raw []byte) error {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return err
 	}
-	cfg := config{Endpoint: "http://headroom:8787/v1/compress", TimeoutMS: 10000, MinChars: 512, TargetRatio: 0.5, CompressUserMessages: true}
+	cfg := config{Endpoint: "http://127.0.0.1:8787/v1/compress", TimeoutMS: 10000, MinChars: 512, TargetRatio: 0.5, CompressUserMessages: true}
 	if err := yaml.Unmarshal(req.ConfigYAML, &cfg); err != nil {
 		return err
 	}

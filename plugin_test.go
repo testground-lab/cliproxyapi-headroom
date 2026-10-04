@@ -218,3 +218,12 @@ func TestDispatchRecoversPanic(t *testing.T) {
 		t.Fatalf("ok=%v raw=%s", ok, raw)
 	}
 }
+func TestDefaultEndpointIsLoopback(t *testing.T) {
+	r, _ := json.Marshal(map[string]any{"config_yaml": []byte("min_chars: 10\n")})
+	if e := configure(r); e != nil {
+		t.Fatal(e)
+	}
+	if got := settings.Load().Endpoint; got != "http://127.0.0.1:8787/v1/compress" {
+		t.Fatalf("default endpoint = %s", got)
+	}
+}
