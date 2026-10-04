@@ -107,6 +107,12 @@ func pluginCall(method string, requestLen uint64, read func() []byte) (raw []byt
 	if requestLen > maxRequestBytes {
 		return errorEnvelope("request_too_large", "request exceeds plugin size limit"), false
 	}
+	if method == "request.intercept_before" {
+		if !acquireCompressionSlot() {
+			return busyResponse(), true
+		}
+		defer releaseCompressionSlot()
+	}
 	return dispatch(method, read(), handleMethod)
 }
 

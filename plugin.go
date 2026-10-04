@@ -117,6 +117,29 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 	}
 }
 
+// compressionSlots caps concurrent interceptions so that many large requests
+// held by a slow Headroom cannot keep unbounded decoded copies in memory.
+// Acquisition never blocks: when saturated the request passes unchanged.
+var compressionSlots = make(chan struct{}, 8)
+
+func acquireCompressionSlot() bool {
+	select {
+	case compressionSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+func releaseCompressionSlot() { <-compressionSlots }
+
+func busyResponse() []byte {
+	if cfg := settings.Load(); cfg != nil && cfg.stats != nil {
+		cfg.stats.record(metricEvent{Status: "fallback", Reason: "compression concurrency limit reached"})
+	}
+	raw, _ := okEnvelope(interceptResponse{})
+	return raw
+}
+
 type candidate struct {
 	text  string
 	role  string

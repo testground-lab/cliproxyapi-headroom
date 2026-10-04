@@ -8,6 +8,8 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -238,5 +240,61 @@ func TestPluginCallRejectsOversizedRequestWithoutReading(t *testing.T) {
 	raw, ok := pluginCall("request.intercept_before", 1, func() []byte { panic("read failed") })
 	if ok || !strings.Contains(string(raw), "plugin_panic") {
 		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+}
+func TestInterceptSaturationPassesThrough(t *testing.T) {
+	setup(t, "http://127.0.0.1:1/v1/compress")
+	for i := 0; i < cap(compressionSlots); i++ {
+		if !acquireCompressionSlot() {
+			t.Fatal("slot unavailable")
+		}
+	}
+	raw, ok := pluginCall("request.intercept_before", 10, func() []byte { t.Fatal("request was read while saturated"); return nil })
+	var env envelope
+	if !ok || json.Unmarshal(raw, &env) != nil || !env.OK || string(env.Result) != `{"Body":null}` {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+	if _, ok := pluginCall("management.register", 0, func() []byte { return nil }); !ok {
+		t.Fatal("non-intercept methods must not be throttled")
+	}
+	for i := 0; i < cap(compressionSlots); i++ {
+		releaseCompressionSlot()
+	}
+	read := false
+	if _, ok := pluginCall("request.intercept_before", 2, func() []byte { read = true; return []byte("{}") }); !ok || !read || len(compressionSlots) != 0 {
+		t.Fatalf("ok=%v read=%v inflight=%d", ok, read, len(compressionSlots))
+	}
+}
+func TestInterceptConcurrencyNeverExceedsLimit(t *testing.T) {
+	release := make(chan struct{})
+	var peak, cur atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := cur.Add(1)
+		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+		}
+		<-release
+		cur.Add(-1)
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	setup(t, srv.URL)
+	req, _ := json.Marshal(map[string]any{"Body": []byte(`{"messages":[{"role":"tool","content":"` + strings.Repeat("x", 50) + `"}]}`)})
+	var wg sync.WaitGroup
+	var passed atomic.Int32
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw, ok := pluginCall("request.intercept_before", uint64(len(req)), func() []byte { return req })
+			if ok && strings.Contains(string(raw), `"Body":null`) {
+				passed.Add(1)
+			}
+		}()
+	}
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if peak.Load() > int32(cap(compressionSlots)) || passed.Load() != 20 || len(compressionSlots) != 0 {
+		t.Fatalf("peak=%d passed=%d inflight=%d", peak.Load(), passed.Load(), len(compressionSlots))
 	}
 }
