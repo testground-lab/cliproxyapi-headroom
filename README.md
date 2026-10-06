@@ -21,7 +21,7 @@ Headroom returns compressed content; it does not forward the generation request.
 
 ## Requirements
 
-Tested with CLIProxyAPI v7.3.17 and Headroom v0.37.0 on Linux amd64. Release archives target Linux amd64/arm64, macOS amd64/arm64, and Windows amd64; native platform CI validates each build. Headroom must run separately and support `/v1/compress` with `config.mode: lossy_inline`. The earlier compression-only plugin was also exercised with the existing deployment originally labelled 0.33.0; the live service now reports 0.37.0.
+Tested with CLIProxyAPI v7.3.17 and Headroom v0.37.0 on Linux amd64. Release archives target Linux amd64/arm64, macOS amd64/arm64, and Windows amd64; native platform CI validates each build. Headroom must run separately and support `/v1/compress`; for compression with the plugin's default `mode: ""`, the server's default mode must be marker-free (e.g. `--lossless` or `--no-ccr`). The earlier compression-only plugin was also exercised with the existing deployment originally labelled 0.33.0; the live service now reports 0.37.0.
 
 ## Install
 
@@ -39,12 +39,15 @@ plugins:
       timeout_ms: 10000
       min_chars: 512
       target_ratio: 0.5
+      mode: ""
       compress_user_messages: true
       token_env: ""
       service_url: ""
 ```
 
 Restart CLIProxyAPI, then refresh the manager and select **Headroom Stats**. The page stays in the manager menu iframe. You can also open `http://<CPA-host>:8317/v0/resource/plugins/headroom/stats` directly. For saved-key reuse, open it on the same host and port as the manager where you signed in. Both Docker containers must share a network. Headroom requires `HEADROOM_COMPRESS_ALLOW_REMOTE=1` for compression requests from another container. If authentication is configured, set `token_env` to the name of a Headroom-token environment variable available to CLIProxyAPI; client and provider credentials are never forwarded.
+
+`mode: ""` (the default) follows the Headroom server's mode; upgrading without `mode` set moves from `lossy_inline` to the server's default mode. Recommended with `headroom proxy --lossless`, which only folds search, log and diff output and passes other content through unchanged, so savings on prose and code are close to zero. Set `mode: "lossy_inline"` for the previous behavior, which can drop words from text. Other mode values are rejected.
 
 `service_url` optionally overrides the service root used for health/statistics. Empty uses the origin of `endpoint`. Use it if Headroom is hosted under a URL prefix. Keep these operator-configured endpoints on trusted infrastructure.
 
@@ -66,9 +69,9 @@ The service section separately reads all five Headroom endpoints in parallel, wi
 
 Eligible text includes Chat `tool`/legacy `function` content, Anthropic `tool_result` text, Responses `function_call_output`, and string leaves within Gemini `functionResponse.response` objects. With `compress_user_messages: true` (the default), it also includes user-role string content and text blocks in Chat, Anthropic, Responses and Gemini requests. System messages remain untouched. Text shorter than `min_chars` bytes passes through. Gemini numeric fields and strings directly inside arrays are not compressed.
 
-The setting is read from CLIProxyAPI's plugin config at registration/reconfiguration and passed to Headroom in every compression request. Set it to `false` to restore tool-result-only behavior. Headroom's `HEADROOM_SAVINGS_PROFILE` controls server-side defaults and transforms; it cannot make this plugin select a field it has skipped. The per-request `compress_user_messages` value from this plugin takes precedence over that default. User-message compression is lossy and can shorten both documents and instructions within the same message. Test answer quality for your workload before relying on exact quotations or extraction.
+The setting is read from CLIProxyAPI's plugin config at registration/reconfiguration and passed to Headroom in every compression request. Set it to `false` to restore tool-result-only behavior. Headroom's `HEADROOM_SAVINGS_PROFILE` controls server-side defaults and transforms; it cannot make this plugin select a field it has skipped. The per-request `compress_user_messages` value from this plugin takes precedence over that default. When the selected Headroom mode is lossy, user-message compression can shorten both documents and instructions within the same message. Test answer quality for your workload before relying on exact quotations or extraction.
 
-The plugin uses marker-free `lossy_inline` mode and rejects CCR hashes. It does not provide retrieval tools, contextual cross-message optimization or provider prefix-cache tracking. Compression is lossy; savings and answer quality depend on workload. The target ratio is not guaranteed. WebSocket behavior depends on the host invoking its interception hook and has not been independently tested.
+With `mode: ""` the plugin uses Headroom's server-configured mode; responses containing CCR hashes or retrieval markers are rejected and the original request is sent unchanged. It does not provide retrieval tools, contextual cross-message optimization or provider prefix-cache tracking. Compression may be lossy depending on the selected mode; savings and answer quality depend on workload. The target ratio is not guaranteed. WebSocket behavior depends on the host invoking its interception hook and has not been independently tested.
 
 Compression errors/timeouts preserve the original request. Bodies over 32 MiB bypass compression. Pending compression calls may continue until their deadline after a client disconnects because the native RPC interface does not expose the host request context. Metrics are not a billing ledger.
 

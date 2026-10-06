@@ -8,6 +8,8 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -39,8 +41,8 @@ func TestProtocolsPreserveEnvelope(t *testing.T) {
 			t.Error("unexpected credentials")
 		}
 		cfg := b["config"].(map[string]any)
-		if cfg["mode"] != "lossy_inline" {
-			t.Error("unsafe mode")
+		if _, exists := cfg["mode"]; exists {
+			t.Error("default mode must be omitted")
 		}
 		msgs := b["messages"].([]any)
 		for _, m := range msgs {
@@ -67,6 +69,56 @@ func TestProtocolsPreserveEnvelope(t *testing.T) {
 		if !reflect.DeepEqual(a, b) {
 			t.Fatalf("envelope changed: %s", got)
 		}
+	}
+}
+func TestCompressionMode(t *testing.T) {
+	for _, mode := range []string{"", "lossy_inline"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			var hits atomic.Int32
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				var b map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+					t.Error(err)
+					return
+				}
+				want := map[string]any{"target_ratio": 0.5, "protect_recent": float64(0), "protect_analysis_context": false, "compress_user_messages": true}
+				if mode != "" {
+					want["mode"] = mode
+				}
+				if got := b["config"]; !reflect.DeepEqual(got, want) {
+					t.Errorf("compression config = %v, want %v", got, want)
+				}
+				json.NewEncoder(w).Encode(map[string]any{"messages": b["messages"]})
+			}))
+			defer s.Close()
+			setupConfig(t, s.URL, "mode: \""+mode+"\"\n")
+			if got := settings.Load().Mode; got != mode {
+				t.Fatalf("configured mode = %q, want %q", got, mode)
+			}
+			_, err := compressBody(interceptRequest{Body: []byte(`{"messages":[{"role":"tool","content":"long enough to compress"}]}`)}, settings.Load())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("Headroom calls = %d, want 1", got)
+			}
+		})
+	}
+}
+func TestInvalidCompressionMode(t *testing.T) {
+	setup(t, "http://127.0.0.1:8787/v1/compress")
+	previous := settings.Load()
+	for _, mode := range []string{"ccr", "lossless", "lossless_then_lossy", "LOSSY_INLINE", " lossy_inline"} {
+		t.Run(mode, func(t *testing.T) {
+			r, _ := json.Marshal(map[string]any{"config_yaml": []byte("mode: \"" + mode + "\"\n")})
+			if err := configure(r); err == nil {
+				t.Fatal("invalid mode accepted")
+			}
+			if settings.Load() != previous {
+				t.Fatal("invalid config replaced runtime settings")
+			}
+		})
 	}
 }
 func TestFailOpen(t *testing.T) {
@@ -206,4 +258,109 @@ func TestLiveHeadroom(t *testing.T) {
 		t.Fatal("lost unique error")
 	}
 	t.Logf("real Headroom: %d -> %d bytes", len(raw), len(got))
+}
+func TestDispatchRecoversPanic(t *testing.T) {
+	raw, ok := dispatch("request.intercept_before", nil, func(string, []byte) ([]byte, error) { panic("boom") })
+	var env envelope
+	if ok || json.Unmarshal(raw, &env) != nil || env.OK || env.Error == nil || env.Error.Code != "plugin_panic" || env.Error.Message != "boom" {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+	raw, ok = dispatch("x", nil, func(string, []byte) ([]byte, error) { return nil, os.ErrNotExist })
+	if ok || json.Unmarshal(raw, &env) != nil || env.Error == nil || env.Error.Code != "plugin_error" {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+}
+func TestDefaultEndpointIsLoopback(t *testing.T) {
+	r, _ := json.Marshal(map[string]any{"config_yaml": []byte("min_chars: 10\n")})
+	if e := configure(r); e != nil {
+		t.Fatal(e)
+	}
+	if got := settings.Load().Endpoint; got != "http://127.0.0.1:8787/v1/compress" {
+		t.Fatalf("default endpoint = %s", got)
+	}
+}
+func TestPluginCallRejectsOversizedRequestWithoutReading(t *testing.T) {
+	for _, n := range []uint64{maxRequestBytes + 1, 1 << 31, 1<<64 - 1} {
+		raw, ok := pluginCall("request.intercept_before", n, func() []byte { t.Fatal("request was read"); return nil })
+		var env envelope
+		if ok || json.Unmarshal(raw, &env) != nil || env.Error == nil || env.Error.Code != "request_too_large" {
+			t.Fatalf("len=%d ok=%v raw=%s", n, ok, raw)
+		}
+	}
+	raw, ok := pluginCall("request.intercept_before", 1, func() []byte { panic("read failed") })
+	if ok || !strings.Contains(string(raw), "plugin_panic") {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+}
+func TestInterceptSaturationPassesThrough(t *testing.T) {
+	setup(t, "http://127.0.0.1:1/v1/compress")
+	for i := 0; i < cap(compressionSlots); i++ {
+		if !acquireCompressionSlot() {
+			t.Fatal("slot unavailable")
+		}
+	}
+	raw, ok := pluginCall("request.intercept_before", 10, func() []byte { t.Fatal("request was read while saturated"); return nil })
+	var env envelope
+	if !ok || json.Unmarshal(raw, &env) != nil || !env.OK || string(env.Result) != `{"Body":null}` {
+		t.Fatalf("ok=%v raw=%s", ok, raw)
+	}
+	if _, ok := pluginCall("management.register", 0, func() []byte { return nil }); !ok {
+		t.Fatal("non-intercept methods must not be throttled")
+	}
+	for i := 0; i < cap(compressionSlots); i++ {
+		releaseCompressionSlot()
+	}
+	read := false
+	if _, ok := pluginCall("request.intercept_before", 2, func() []byte { read = true; return []byte("{}") }); !ok || !read || len(compressionSlots) != 0 {
+		t.Fatalf("ok=%v read=%v inflight=%d", ok, read, len(compressionSlots))
+	}
+}
+func TestInterceptConcurrencyNeverExceedsLimit(t *testing.T) {
+	release := make(chan struct{})
+	var peak, cur atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := cur.Add(1)
+		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+		}
+		<-release
+		cur.Add(-1)
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	setup(t, srv.URL)
+	req, _ := json.Marshal(map[string]any{"Body": []byte(`{"messages":[{"role":"tool","content":"` + strings.Repeat("x", 50) + `"}]}`)})
+	var wg sync.WaitGroup
+	var passed atomic.Int32
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw, ok := pluginCall("request.intercept_before", uint64(len(req)), func() []byte { return req })
+			if ok && strings.Contains(string(raw), `"Body":null`) {
+				passed.Add(1)
+			}
+		}()
+	}
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if peak.Load() > int32(cap(compressionSlots)) || passed.Load() != 20 || len(compressionSlots) != 0 {
+		t.Fatalf("peak=%d passed=%d inflight=%d", peak.Load(), passed.Load(), len(compressionSlots))
+	}
+}
+func TestTrailingJSONLeavesRequestUnchanged(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.WriteHeader(500) }))
+	defer srv.Close()
+	setup(t, srv.URL)
+	obj := `{"messages":[{"role":"tool","content":"` + strings.Repeat("x", 50) + `"}]}`
+	for _, body := range []string{obj + obj, obj + " garbage", obj + "]"} {
+		out, err := compressBody(interceptRequest{Body: []byte(body)}, settings.Load())
+		if out != nil || err != nil || called {
+			t.Fatalf("body=%q out=%q err=%v called=%v", body, out, err, called)
+		}
+	}
+	if _, _ = compressBody(interceptRequest{Body: []byte(obj + " \n")}, settings.Load()); !called {
+		t.Fatal("trailing whitespace should still be accepted")
+	}
 }
