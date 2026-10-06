@@ -74,7 +74,9 @@ func TestProtocolsPreserveEnvelope(t *testing.T) {
 func TestCompressionMode(t *testing.T) {
 	for _, mode := range []string{"", "lossy_inline"} {
 		t.Run("mode="+mode, func(t *testing.T) {
+			var hits atomic.Int32
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
 				var b map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 					t.Error(err)
@@ -98,15 +100,18 @@ func TestCompressionMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("Headroom calls = %d, want 1", got)
+			}
 		})
 	}
 }
 func TestInvalidCompressionMode(t *testing.T) {
 	setup(t, "http://127.0.0.1:8787/v1/compress")
 	previous := settings.Load()
-	for _, mode := range []string{"ccr", "lossless", "lossless_then_lossy"} {
+	for _, mode := range []string{"ccr", "lossless", "lossless_then_lossy", "LOSSY_INLINE", " lossy_inline"} {
 		t.Run(mode, func(t *testing.T) {
-			r, _ := json.Marshal(map[string]any{"config_yaml": []byte("mode: " + mode + "\n")})
+			r, _ := json.Marshal(map[string]any{"config_yaml": []byte("mode: \"" + mode + "\"\n")})
 			if err := configure(r); err == nil {
 				t.Fatal("invalid mode accepted")
 			}
