@@ -41,8 +41,8 @@ func TestProtocolsPreserveEnvelope(t *testing.T) {
 			t.Error("unexpected credentials")
 		}
 		cfg := b["config"].(map[string]any)
-		if cfg["mode"] != "lossy_inline" {
-			t.Error("unsafe mode")
+		if _, exists := cfg["mode"]; exists {
+			t.Error("default mode must be omitted")
 		}
 		msgs := b["messages"].([]any)
 		for _, m := range msgs {
@@ -69,6 +69,51 @@ func TestProtocolsPreserveEnvelope(t *testing.T) {
 		if !reflect.DeepEqual(a, b) {
 			t.Fatalf("envelope changed: %s", got)
 		}
+	}
+}
+func TestCompressionMode(t *testing.T) {
+	for _, mode := range []string{"", "lossy_inline"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var b map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+					t.Error(err)
+					return
+				}
+				want := map[string]any{"target_ratio": 0.5, "protect_recent": float64(0), "protect_analysis_context": false, "compress_user_messages": true}
+				if mode != "" {
+					want["mode"] = mode
+				}
+				if got := b["config"]; !reflect.DeepEqual(got, want) {
+					t.Errorf("compression config = %v, want %v", got, want)
+				}
+				json.NewEncoder(w).Encode(map[string]any{"messages": b["messages"]})
+			}))
+			defer s.Close()
+			setupConfig(t, s.URL, "mode: \""+mode+"\"\n")
+			if got := settings.Load().Mode; got != mode {
+				t.Fatalf("configured mode = %q, want %q", got, mode)
+			}
+			_, err := compressBody(interceptRequest{Body: []byte(`{"messages":[{"role":"tool","content":"long enough to compress"}]}`)}, settings.Load())
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+func TestInvalidCompressionMode(t *testing.T) {
+	setup(t, "http://127.0.0.1:8787/v1/compress")
+	previous := settings.Load()
+	for _, mode := range []string{"ccr", "lossless", "lossless_then_lossy"} {
+		t.Run(mode, func(t *testing.T) {
+			r, _ := json.Marshal(map[string]any{"config_yaml": []byte("mode: " + mode + "\n")})
+			if err := configure(r); err == nil {
+				t.Fatal("invalid mode accepted")
+			}
+			if settings.Load() != previous {
+				t.Fatal("invalid config replaced runtime settings")
+			}
+		})
 	}
 }
 func TestFailOpen(t *testing.T) {

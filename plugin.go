@@ -29,6 +29,7 @@ type config struct {
 	TimeoutMS            int     `yaml:"timeout_ms"`
 	MinChars             int     `yaml:"min_chars"`
 	TargetRatio          float64 `yaml:"target_ratio"`
+	Mode                 string  `yaml:"mode"`
 	CompressUserMessages bool    `yaml:"compress_user_messages"`
 }
 type runtimeConfig struct {
@@ -62,8 +63,8 @@ func configure(raw []byte) error {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
 		return errors.New("endpoint must be an HTTP(S) URL without embedded credentials")
 	}
-	if cfg.TimeoutMS < 1 || cfg.TimeoutMS > 120000 || cfg.MinChars < 1 || cfg.TargetRatio <= 0 || cfg.TargetRatio >= 1 {
-		return errors.New("invalid timeout_ms, min_chars or target_ratio")
+	if cfg.TimeoutMS < 1 || cfg.TimeoutMS > 120000 || cfg.MinChars < 1 || cfg.TargetRatio <= 0 || cfg.TargetRatio >= 1 || (cfg.Mode != "" && cfg.Mode != "lossy_inline") {
+		return errors.New("invalid timeout_ms, min_chars, target_ratio or mode")
 	}
 	if cfg.ServiceURL != "" {
 		serviceURL, err := url.Parse(cfg.ServiceURL)
@@ -88,7 +89,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 			return nil, err
 		}
 		fields := []map[string]any{}
-		for _, f := range []struct{ name, kind, desc string }{{"service_url", "string", "Optional Headroom service root for health and statistics; defaults to endpoint origin"}, {"stats_path", "string", "Persistent statistics file; empty means memory only"}, {"endpoint", "string", "Headroom compression-only URL"}, {"token_env", "string", "Optional environment variable containing the Headroom token"}, {"timeout_ms", "integer", "Compression timeout; original request is used on failure"}, {"min_chars", "integer", "Minimum text characters to compress"}, {"target_ratio", "number", "Requested retained content ratio"}, {"compress_user_messages", "boolean", "Compress eligible user-message text; defaults to true. System messages remain unchanged"}} {
+		for _, f := range []struct{ name, kind, desc string }{{"service_url", "string", "Optional Headroom service root for health and statistics; defaults to endpoint origin"}, {"stats_path", "string", "Persistent statistics file; empty means memory only"}, {"endpoint", "string", "Headroom compression-only URL"}, {"token_env", "string", "Optional environment variable containing the Headroom token"}, {"timeout_ms", "integer", "Compression timeout; original request is used on failure"}, {"min_chars", "integer", "Minimum text characters to compress"}, {"target_ratio", "number", "Requested retained content ratio"}, {"mode", "string", "Empty follows Headroom server mode; lossy_inline can drop words from text"}, {"compress_user_messages", "boolean", "Compress eligible user-message text; defaults to true. System messages remain unchanged"}} {
 			fields = append(fields, map[string]any{"Name": f.name, "Type": f.kind, "Description": f.desc})
 		}
 		return okEnvelope(map[string]any{"schema_version": 6, "metadata": map[string]any{"Name": "headroom", "Version": version, "Author": author, "GitHubRepository": repository, "ConfigFields": fields}, "capabilities": map[string]any{"request_interceptor": true, "management_api": true}})
@@ -280,7 +281,11 @@ func compressBody(req interceptRequest, cfg *runtimeConfig) (output []byte, fail
 		}
 		messages = append(messages, message)
 	}
-	payload, _ := json.Marshal(map[string]any{"model": req.Model, "messages": messages, "config": map[string]any{"mode": "lossy_inline", "target_ratio": cfg.TargetRatio, "protect_recent": 0, "protect_analysis_context": false, "compress_user_messages": cfg.CompressUserMessages}})
+	compressionConfig := map[string]any{"target_ratio": cfg.TargetRatio, "protect_recent": 0, "protect_analysis_context": false, "compress_user_messages": cfg.CompressUserMessages}
+	if cfg.Mode != "" {
+		compressionConfig["mode"] = cfg.Mode
+	}
+	payload, _ := json.Marshal(map[string]any{"model": req.Model, "messages": messages, "config": compressionConfig})
 	request, err := http.NewRequest(http.MethodPost, cfg.Endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, errors.New("invalid compression request")
